@@ -25,11 +25,13 @@ from linebot.v3.messaging import (
     MessagingApi,
     MessagingApiBlob,
     ReplyMessageRequest,
-    TextMessage
+    TextMessage,
+    ImageMessage
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent, FileMessageContent
 from openai import OpenAI
 import io
+import urllib.parse
 from pypdf import PdfReader
 
 # เริ่มต้นไลบรารีและอ็อบเจกต์ที่จำเป็น
@@ -104,22 +106,69 @@ def handle_message(event):
                 break
                 
     if should_respond:
-        if not cleaned_message:
-            # กรณีผู้ใช้พิมพ์แค่คำเรียกบอท เช่น "บอท" ให้แนะนำวิธีใช้
-            reply_text = "สวัสดีครับ! ผมคือผู้เชี่ยวชาญ/ที่ปรึกษาประจำกลุ่มนี้ ยินดีให้คำปรึกษาและคำแนะนำในด้านต่าง ๆ ครับ มีเรื่องอะไรอยากให้ช่วยเหลือ สามารถถามเข้ามาได้เลยครับ!"
+        # ตรวจสอบเพิ่มเติมว่าต้องการสร้างรูปภาพหรืออินโฟกราฟิกหรือไม่
+        is_image_request = False
+        image_prompt = ""
+        image_prefixes = ['วาดรูป', 'สร้างภาพ', 'อินโฟกราฟิก', 'อินโฟกราฟฟิก', 'อินโฟ']
+        
+        for img_pref in image_prefixes:
+            if cleaned_message.lower().startswith(img_pref.lower()):
+                is_image_request = True
+                image_prompt = cleaned_message[len(img_pref):].strip()
+                if image_prompt.startswith(':') or image_prompt.startswith(',') or image_prompt.startswith(' '):
+                    image_prompt = image_prompt[1:].strip()
+                break
+
+        if is_image_request:
+            if not image_prompt:
+                reply_text = "กรุณาระบุรายละเอียดรูปภาพที่คุณต้องการให้วาดด้วยครับ เช่น 'อินโฟกราฟิก ขั้นตอนการออมเงิน'"
+                with ApiClient(configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    line_bot_api.reply_message(
+                        ReplyMessageRequest(
+                            reply_token=event.reply_token,
+                            messages=[TextMessage(text=reply_text)]
+                        )
+                    )
+            else:
+                # ตกแต่ง Prompt ให้เน้นสไตล์อินโฟกราฟิกตามที่ผู้ใช้กำหนด
+                styled_prompt = f"{image_prompt}, flat vector infographic design, professional clean presentation, charts and diagrams, minimal icons, structured educational layout"
+                encoded_prompt = urllib.parse.quote(styled_prompt)
+                
+                # ลิงก์สำหรับดึงภาพผลลัพธ์จาก Pollinations.ai (ไม่มีลายน้ำและฟรี 100%)
+                image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true&private=true"
+                
+                # ส่งทั้งข้อความสถานะและรูปภาพกลับไปพร้อมกันในชุดเดียว
+                status_text = f"🎨 กำลังสร้างภาพอินโฟกราฟิกเกี่ยวกับ: '{image_prompt}'\nกรุณารอสักครู่เพื่อโหลดรูปภาพ..."
+                
+                with ApiClient(configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    line_bot_api.reply_message(
+                        ReplyMessageRequest(
+                            reply_token=event.reply_token,
+                            messages=[
+                                TextMessage(text=status_text),
+                                ImageMessage(original_content_url=image_url, preview_image_url=image_url)
+                            ]
+                        )
+                    )
         else:
-            # ส่งไปถาม ChatGPT
-            reply_text = ask_openai(cleaned_message)
-            
-        # ตอบกลับข้อความไปยัง LINE
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text=reply_text)]
+            if not cleaned_message:
+                # กรณีผู้ใช้พิมพ์แค่คำเรียกบอท เช่น "บอท" ให้แนะนำวิธีใช้
+                reply_text = "สวัสดีครับ! ผมคือผู้เชี่ยวชาญ/ที่ปรึกษาประจำกลุ่มนี้ ยินดีให้คำปรึกษาและคำแนะนำในด้านต่าง ๆ ครับ มีเรื่องอะไรอยากให้ช่วยเหลือ สามารถถามเข้ามาได้เลยครับ!"
+            else:
+                # ส่งไปถาม ChatGPT
+                reply_text = ask_openai(cleaned_message)
+                
+            # ตอบกลับข้อความไปยัง LINE
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=reply_text)]
+                    )
                 )
-            )
 @handler.add(MessageEvent, message=FileMessageContent)
 def handle_file(event):
     message_id = event.message.id
