@@ -23,11 +23,14 @@ from linebot.v3.messaging import (
     Configuration,
     ApiClient,
     MessagingApi,
+    MessagingApiBlob,
     ReplyMessageRequest,
     TextMessage
 )
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from linebot.v3.webhooks import MessageEvent, TextMessageContent, FileMessageContent
 from openai import OpenAI
+import io
+from pypdf import PdfReader
 
 # เริ่มต้นไลบรารีและอ็อบเจกต์ที่จำเป็น
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN or "")
@@ -109,6 +112,79 @@ def handle_message(event):
             reply_text = ask_openai(cleaned_message)
             
         # ตอบกลับข้อความไปยัง LINE
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_text)]
+                )
+            )
+@handler.add(MessageEvent, message=FileMessageContent)
+def handle_file(event):
+    message_id = event.message.id
+    file_name = event.message.file_name
+    
+    # ดึงนามสกุลไฟล์เพื่อตรวจสอบว่าเป็น PDF หรือไม่
+    if not file_name.lower().endswith('.pdf'):
+        reply_text = f"ระบบรองรับการอ่านและสรุปเฉพาะไฟล์ PDF เท่านั้นครับ (คุณส่งไฟล์: {file_name})"
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_text)]
+                )
+            )
+        return
+
+    try:
+        # ดาวน์โหลดไฟล์ PDF จาก LINE
+        with ApiClient(configuration) as api_client:
+            messaging_blob_api = MessagingApiBlob(api_client)
+            message_content = messaging_blob_api.get_message_content(message_id)
+            
+            # แปลงข้อมูลไบนารีและสกัดข้อความ
+            if hasattr(message_content, 'read'):
+                pdf_data = message_content.read()
+            else:
+                pdf_data = message_content
+                
+            pdf_bytes = io.BytesIO(pdf_data)
+            reader = PdfReader(pdf_bytes)
+            
+            pdf_text = ""
+            for page in reader.pages:
+                pdf_text += page.extract_text() or ""
+                
+            pdf_text = pdf_text.strip()
+            
+            if not pdf_text:
+                reply_text = f"ไม่สามารถสกัดข้อความออกจากไฟล์ PDF '{file_name}' นี้ได้ครับ เอกสารอาจเป็นสแกนรูปภาพล้วนที่ไม่มีเลเยอร์ข้อความ"
+            else:
+                # จำกัดขนาดข้อความสำหรับส่งให้ OpenAI (เพื่อไม่ให้ค่าบริการสูงเกินไป)
+                max_chars = 20000
+                if len(pdf_text) > max_chars:
+                    pdf_text = pdf_text[:max_chars] + "\n...(ข้อความส่วนที่เหลือถูกตัดออกเนื่องจากเกินโควตาเนื้อหา)..."
+                
+                # เรียกใช้งาน ChatGPT เพื่อทำการสรุปเอกสาร
+                prompt = f"กรุณาสรุปเนื้อหาสำคัญจากเอกสาร PDF นี้เป็นภาษาไทยอย่างกระชับตรงประเด็น และเข้าใจง่าย โดยแยกเป็นหัวข้อสำคัญหลักๆ:\n\n{pdf_text}"
+                summary = ask_openai(prompt)
+                
+                reply_text = f"📄 สรุปเนื้อหาไฟล์เอกสาร: {file_name}\n\n{summary}"
+                
+            # ส่งคำตอบกลับหาผู้ใช้
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_text)]
+                )
+            )
+            
+    except Exception as e:
+        app.logger.error(f"Error processing PDF: {e}")
+        reply_text = f"ขออภัยครับ เกิดข้อผิดพลาดในการโหลดหรืออ่านไฟล์ PDF: {str(e)}"
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
             line_bot_api.reply_message(
