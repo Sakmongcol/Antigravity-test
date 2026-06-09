@@ -31,8 +31,10 @@ from linebot.v3.messaging import (
 from linebot.v3.webhooks import MessageEvent, TextMessageContent, FileMessageContent
 from openai import OpenAI
 import io
+import re
 import urllib.parse
 from pypdf import PdfReader
+from youtube_transcript_api import YouTubeTranscriptApi
 
 # เริ่มต้นไลบรารีและอ็อบเจกต์ที่จำเป็น
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN or "")
@@ -79,6 +81,173 @@ def ask_openai(question: str) -> str:
         app.logger.error(f"OpenAI API Error: {e}")
         return f"ขออภัยครับ เกิดข้อผิดพลาดในการประมวลผลคำแนะนำ: {str(e)}"
 
+def extract_youtube_video_id(url: str) -> str:
+    """ฟังก์ชันสกัด Video ID ออกจากลิงก์ YouTube รูปแบบต่าง ๆ"""
+    pattern = r'(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|\S*?[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})'
+    match = re.search(pattern, url)
+    return match.group(1) if match else None
+
+def summarize_youtube_video(video_id: str) -> str:
+    """ฟังก์ชันดึงคำบรรยายวิดีโอ YouTube และสรุปผลด้วย OpenAI"""
+    try:
+        # ดึงข้อมูลรายการคำบรรยายทั้งหมดของวิดีโอ
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        
+        # ค้นหาคำบรรยายภาษาไทยก่อน หากไม่มีให้ใช้ภาษาอังกฤษ หากไม่มีอีกให้ใช้ตัวเลือกแรกสุดที่มี
+        try:
+            transcript = transcript_list.find_transcript(['th'])
+        except Exception:
+            try:
+                transcript = transcript_list.find_transcript(['en'])
+            except Exception:
+                # เลือกตัวแรกสุดที่มีในรายการคำบรรยาย (เช่น ภาษาอื่น ๆ)
+                transcript = next(iter(transcript_list))
+                
+        # ดึงบทพูดและรวบรวมเป็นข้อความยาวชุดเดียว
+        transcript_data = transcript.fetch()
+        full_text = " ".join([item['text'] for item in transcript_data])
+        
+        # จำกัดเนื้อหาให้อยู่ในขอบเขต 20,000 ตัวอักษร เพื่อประหยัดค่าบริการ API
+        max_chars = 20000
+        if len(full_text) > max_chars:
+            full_text = full_text[:max_chars] + "\n...(เนื้อหาบทสนทนาส่วนที่เหลือถูกตัดออกเนื่องจากยาวเกินโควตา)..."
+            
+        # กำหนด Prompt สำหรับสั่งการ ChatGPT ในการสรุปและแปลเป็นภาษาไทย
+        prompt = (
+            "คุณเป็นผู้เชี่ยวชาญในการสรุปเนื้อหาวิดีโอ หน้าที่ของคุณคือการสรุปข้อมูลเนื้อหาจากวิดีโอ YouTube นี้เป็นภาษาไทย "
+            "โดยการสรุปจะต้องกระชับ ตรงประเด็น และครอบคลุมเนื้อหาสำคัญทั้งหมด แบ่งโครงสร้างออกเป็นหัวข้อหลักๆ ที่เข้าใจง่าย "
+            "หากบทสนทนาในวิดีโอเป็นภาษาต่างประเทศ ให้แปลและเรียบเรียงออกมาเป็นภาษาไทยที่ถูกต้อง สละสลวย:\n\n"
+            f"เนื้อหาบทสนทนาในวิดีโอ:\n{full_text}"
+        )
+        
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a professional video content summarizer and translator."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=1000,
+            temperature=0.5
+        )
+        return response.choices[0].message.content.strip()
+        
+    except Exception as e:
+        err_msg = str(e)
+        if "No transcripts were found" in err_msg or "Subtitles are disabled" in err_msg:
+            return "ไม่พบคำบรรยาย (Subtitles/Captions) ในวิดีโอ YouTube นี้ครับ ทำให้ไม่สามารถสกัดข้อความเสียงเพื่อมาสรุปเนื้อหาได้"
+        return f"ขออภัยครับ เกิดข้อผิดพลาดในการดาวน์โหลดคำบรรยายวิดีโอ: {err_msg}"
+
+
+def extract_youtube_video_id(url: str) -> str:
+    """Extract a YouTube video ID from common YouTube URL formats."""
+    patterns = [
+        r'(?:https?://)?(?:www\.|m\.)?youtube\.com/watch\?(?:[^#\s]*&)?v=([a-zA-Z0-9_-]{11})',
+        r'(?:https?://)?(?:www\.|m\.)?youtube\.com/(?:shorts|live|embed|v)/([a-zA-Z0-9_-]{11})',
+        r'(?:https?://)?youtu\.be/([a-zA-Z0-9_-]{11})',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _transcript_items_to_text(transcript_data) -> str:
+    """Normalize transcript rows from old/new youtube-transcript-api versions."""
+    chunks = []
+    for item in transcript_data:
+        if isinstance(item, dict):
+            text = item.get("text", "")
+        else:
+            text = getattr(item, "text", "")
+        text = re.sub(r"\s+", " ", text).strip()
+        if text:
+            chunks.append(text)
+    return " ".join(chunks)
+
+
+def _fetch_best_youtube_transcript(video_id: str) -> tuple[str, str]:
+    """Fetch Thai first, then English, then any available transcript."""
+    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+
+    try:
+        transcript = transcript_list.find_transcript(["th"])
+    except Exception:
+        try:
+            transcript = transcript_list.find_transcript(["en"])
+        except Exception:
+            transcript = next(iter(transcript_list))
+
+    language = getattr(transcript, "language_code", "unknown")
+    return _transcript_items_to_text(transcript.fetch()), language
+
+
+def summarize_youtube_video(video_id: str) -> str:
+    """Summarize a YouTube video transcript concisely in Thai."""
+    try:
+        full_text, language = _fetch_best_youtube_transcript(video_id)
+
+        if not full_text:
+            return "ไม่พบข้อความคำบรรยายในคลิปนี้ จึงยังสรุปเนื้อหาให้ไม่ได้ครับ"
+
+        max_chars = 24000
+        was_truncated = len(full_text) > max_chars
+        if was_truncated:
+            full_text = full_text[:max_chars]
+
+        prompt = f"""
+สรุปเนื้อหาจาก transcript ของคลิป YouTube นี้เป็นภาษาไทยเท่านั้น
+
+ข้อกำหนด:
+- เขียนให้กระชับแต่ครอบคลุมประเด็นสำคัญ
+- ถ้าต้นฉบับเป็นภาษาต่างประเทศ ให้แปลและเรียบเรียงเป็นภาษาไทยธรรมชาติ
+- ห้ามใส่ข้อมูลที่ไม่มีอยู่ใน transcript
+- จัดรูปแบบอ่านง่ายสำหรับ LINE โดยใช้หัวข้อสั้น ๆ
+- ความยาวรวมไม่เกินประมาณ 2,800 ตัวอักษร
+
+ภาษา transcript ที่เลือกใช้: {language}
+หมายเหตุ: transcript {'ถูกตัดบางส่วนเพราะยาวมาก' if was_truncated else 'ถูกส่งครบตามที่ดึงได้'}
+
+Transcript:
+{full_text}
+""".strip()
+
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You summarize and translate video transcripts into concise, accurate Thai."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=1200,
+            temperature=0.3
+        )
+        summary = response.choices[0].message.content.strip()
+        if len(summary) > 4500:
+            summary = summary[:4450].rstrip() + "\n\n...(ตัดให้สั้นลงเพื่อให้ส่งใน LINE ได้)"
+        return summary
+
+    except Exception as e:
+        err_msg = str(e)
+        if "No transcripts were found" in err_msg or "Subtitles are disabled" in err_msg or "TranscriptsDisabled" in err_msg:
+            return "ไม่พบคำบรรยาย/Subtitles ในคลิป YouTube นี้ จึงยังไม่สามารถสรุปจากเสียงของคลิปได้ครับ"
+        if "VideoUnavailable" in err_msg:
+            return "เปิดคลิป YouTube นี้ไม่ได้ครับ อาจเป็นคลิปส่วนตัว ถูกลบ หรือจำกัดการเข้าถึง"
+        app.logger.error(f"YouTube transcript summary error: {e}")
+        return f"ขออภัยครับ เกิดข้อผิดพลาดในการสรุปคลิป YouTube: {err_msg}"
+
+
+def is_youtube_summary_error(reply_text: str) -> bool:
+    """Return True when the YouTube summary result is an error/status message."""
+    error_starts = (
+        "ไม่พบ",
+        "เปิดคลิป",
+        "ขออภัย",
+        "à¹„à¸¡à¹ˆ",
+        "à¸‚à¸­à¸­à¸ à¸±à¸¢",
+    )
+    return reply_text.startswith(error_starts)
+
+
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     user_message = event.message.text
@@ -105,7 +274,35 @@ def handle_message(event):
                     cleaned_message = cleaned_message[1:].strip()
                 break
                 
-    if should_respond:
+    # ตรวจสอบว่าในข้อความดิบมีลิงก์ YouTube หรือไม่
+    youtube_id = extract_youtube_video_id(user_message)
+    
+    is_youtube_request = False
+    if youtube_id:
+        if source_type == 'user':
+            is_youtube_request = True
+        else:
+            # ในกลุ่มไลน์: ตอบสนองหากมีคำสั่งเรียกบอทนำหน้า หรือหากข้อความประกอบด้วยลิงก์เดี่ยวๆ ล้วนๆ
+            is_only_link = re.match(r'^https?:\/\/(?:www\.)?(?:youtube\.com|youtu\.be)\/\S+$', cleaned_message) is not None
+            if should_respond or is_only_link:
+                is_youtube_request = True
+
+    if is_youtube_request:
+        # ส่งข้อความสรุปคลิปวิดีโอ YouTube
+        reply_text = summarize_youtube_video(youtube_id)
+        # เติมหัวเรื่องระบุความพร้อม
+        if not is_youtube_summary_error(reply_text):
+            reply_text = f"📹 สรุปเนื้อหาวิดีโอ YouTube:\n\n{reply_text}"
+            
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_text)]
+                )
+            )
+    elif should_respond:
         # ตรวจสอบเพิ่มเติมว่าต้องการสร้างรูปภาพหรืออินโฟกราฟิกหรือไม่
         is_image_request = False
         image_prompt = ""
