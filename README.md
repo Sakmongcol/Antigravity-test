@@ -55,7 +55,7 @@
 2. เลือก Runtime เป็น **Python**
 3. ตั้งค่าคำสั่งในแต่ละส่วนดังนี้:
    - **Build Command**: `pip install -r requirements.txt`
-   - **Start Command**: `gunicorn line-bot:app`
+   - **Start Command**: `gunicorn wsgi:app`
 4. เพิ่ม **Environment Variables** ในแถบการตั้งค่าบน Render:
    - `LINE_CHANNEL_ACCESS_TOKEN`
    - `LINE_CHANNEL_SECRET`
