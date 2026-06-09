@@ -140,6 +140,28 @@ def summarize_youtube_video(video_id: str) -> str:
 
 def extract_youtube_video_id(url: str) -> str:
     """Extract a YouTube video ID from common YouTube URL formats."""
+    url_candidates = re.findall(r'(?:https?://)?(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)/[^\s<>"\']+', url)
+    for candidate in url_candidates:
+        normalized = candidate if candidate.startswith(("http://", "https://")) else f"https://{candidate}"
+        parsed = urllib.parse.urlparse(normalized)
+        host = parsed.netloc.lower()
+        path_parts = [part for part in parsed.path.split("/") if part]
+
+        if host.endswith("youtu.be") and path_parts:
+            video_id = path_parts[0]
+            if re.fullmatch(r"[a-zA-Z0-9_-]{11}", video_id):
+                return video_id
+
+        if host.endswith("youtube.com"):
+            query_video_id = urllib.parse.parse_qs(parsed.query).get("v", [None])[0]
+            if query_video_id and re.fullmatch(r"[a-zA-Z0-9_-]{11}", query_video_id):
+                return query_video_id
+
+            if len(path_parts) >= 2 and path_parts[0] in {"shorts", "live", "embed", "v"}:
+                video_id = path_parts[1]
+                if re.fullmatch(r"[a-zA-Z0-9_-]{11}", video_id):
+                    return video_id
+
     patterns = [
         r'(?:https?://)?(?:www\.|m\.)?youtube\.com/watch\?(?:[^#\s]*&)?v=([a-zA-Z0-9_-]{11})',
         r'(?:https?://)?(?:www\.|m\.)?youtube\.com/(?:shorts|live|embed|v)/([a-zA-Z0-9_-]{11})',
@@ -150,6 +172,11 @@ def extract_youtube_video_id(url: str) -> str:
         if match:
             return match.group(1)
     return None
+
+
+def has_youtube_link(text: str) -> bool:
+    """Return True when text appears to contain a YouTube link."""
+    return re.search(r'(?:youtube\.com|youtu\.be)', text, re.IGNORECASE) is not None
 
 
 def _transcript_items_to_text(transcript_data) -> str:
@@ -196,14 +223,20 @@ def summarize_youtube_video(video_id: str) -> str:
             full_text = full_text[:max_chars]
 
         prompt = f"""
-สรุปเนื้อหาจาก transcript ของคลิป YouTube นี้เป็นภาษาไทยเท่านั้น
+อ่าน transcript ของคลิป YouTube แล้วสรุปและวิเคราะห์ออกมาเป็นภาษาไทยเท่านั้น
+
+ให้ตอบเป็นโครงสร้างนี้:
+1. สรุปสั้น ๆ: อธิบายใจความหลักของคลิปใน 2-4 ประโยค
+2. ประเด็นสำคัญ: bullet สั้น ๆ ครอบคลุมเนื้อหาหลัก
+3. วิเคราะห์/ข้อสังเกต: อธิบายความหมาย ผลกระทบ หรือสิ่งที่ผู้ชมควรเข้าใจจากเนื้อหา
+4. สิ่งที่นำไปใช้ได้: bullet สั้น ๆ ถ้ามีประเด็นเชิงปฏิบัติ
 
 ข้อกำหนด:
-- เขียนให้กระชับแต่ครอบคลุมประเด็นสำคัญ
 - ถ้าต้นฉบับเป็นภาษาต่างประเทศ ให้แปลและเรียบเรียงเป็นภาษาไทยธรรมชาติ
 - ห้ามใส่ข้อมูลที่ไม่มีอยู่ใน transcript
-- จัดรูปแบบอ่านง่ายสำหรับ LINE โดยใช้หัวข้อสั้น ๆ
-- ความยาวรวมไม่เกินประมาณ 2,800 ตัวอักษร
+- ถ้า transcript ไม่พอสำหรับวิเคราะห์ ให้บอกตามตรงและวิเคราะห์เฉพาะจากข้อมูลที่มี
+- จัดรูปแบบอ่านง่ายสำหรับ LINE
+- ความยาวรวมไม่เกินประมาณ 3,500 ตัวอักษร
 
 ภาษา transcript ที่เลือกใช้: {language}
 หมายเหตุ: transcript {'ถูกตัดบางส่วนเพราะยาวมาก' if was_truncated else 'ถูกส่งครบตามที่ดึงได้'}
@@ -276,9 +309,12 @@ def handle_message(event):
                 
     # ตรวจสอบว่าในข้อความดิบมีลิงก์ YouTube หรือไม่
     youtube_id = extract_youtube_video_id(user_message)
+    youtube_link_seen = has_youtube_link(user_message)
     
     is_youtube_request = False
     if youtube_id:
+        is_youtube_request = True
+    if False:
         if source_type == 'user':
             is_youtube_request = True
         else:
@@ -292,8 +328,18 @@ def handle_message(event):
         reply_text = summarize_youtube_video(youtube_id)
         # เติมหัวเรื่องระบุความพร้อม
         if not is_youtube_summary_error(reply_text):
-            reply_text = f"📹 สรุปเนื้อหาวิดีโอ YouTube:\n\n{reply_text}"
+            reply_text = f"สรุปและวิเคราะห์คลิป YouTube:\n\n{reply_text}"
             
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_text)]
+                )
+            )
+    elif youtube_link_seen:
+        reply_text = "ผมเห็นลิงก์ YouTube แล้วครับ แต่ยังอ่าน Video ID ไม่ได้ รบกวนส่งลิงก์แบบเต็ม เช่น https://www.youtube.com/watch?v=XXXXXXXXXXX หรือ https://youtu.be/XXXXXXXXXXX"
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
             line_bot_api.reply_message(
